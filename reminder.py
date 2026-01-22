@@ -13,14 +13,17 @@ load_dotenv(dotenv_path=env_path)
 client = slack.WebClient(token=os.environ["SLACK_TOKEN"])
 
 # Configuration - PRODUCTION MODE
-MONITORED_CHANNEL = "#enterprise-customers-followup"  # Channel to monitor for tickets
+MONITORED_CHANNEL = "#ip-test"  # Channel to monitor for tickets
 ALERTS_CHANNEL = "#ip_reminder"  # Channel to send reminders to
-CHECK_INTERVAL_HOURS = 6  # Check every 6 hours
+CHECK_INTERVAL_HOURS = 0.003  # Check every 6 hours
 CHECKMARK_EMOJI = "white_check_mark"  # The checkmark emoji name (✅)
 CHECKED_EMOJI = "eyes"  # Emoji to mark message as checked (👀)
 
 # Track: original_message_ts -> reminder_message_ts (so we can delete reminders)
 sent_reminders = {}
+
+# Track messages that have been marked as resolved (to post Date Ended only once)
+resolved_messages = set()
 
 
 def get_channel_id(channel_name):
@@ -163,12 +166,111 @@ def delete_reminder(alerts_channel_id, reminder_ts):
         return False
 
 
-def reply_to_original_thread(channel_id, thread_ts):
-    """Add a reply to the original message thread with check time."""
+def extract_sender_from_ticket(message_text):
+    """Extract sender mention from ticket message."""
+    # Look for Slack user ID format anywhere after "Sender:" - handles *<@U123>* or <@U123>
+    match = re.search(r"Sender:.*?<@([A-Z0-9]+)>", message_text, re.IGNORECASE)
+    if match:
+        user_id = match.group(1)
+        return user_id, f"<@{user_id}>"
+
+    # Fallback: try plain text format Sender: @Name or Sender: Name
+    match = re.search(r"Sender:\s*\*?@?([^*\n<>]+)", message_text, re.IGNORECASE)
+    if match:
+        name = match.group(1).strip()
+        if name:
+            return None, f"@{name}"
+
+    return None, None
+
+
+def extract_team_from_ticket(message_text):
+    """Extract To Team mention from ticket message."""
+    # Look for Slack user/group ID format after "To Team:" - handles *<@U123>* or <!subteam^S123>
+    match = re.search(r"To Team:.*?<[@!]([A-Z0-9^]+)>", message_text, re.IGNORECASE)
+    if match:
+        team_id = match.group(1)
+        # Handle subteam format like "subteam^S123ABC"
+        if "^" in team_id:
+            team_id = team_id.split("^")[1]
+            return team_id, f"<!subteam^{team_id}>"
+        return team_id, f"<@{team_id}>"
+
+    # Fallback: try plain text format To Team: @team-name
+    match = re.search(r"To Team:.*?@([\w-]+)", message_text, re.IGNORECASE)
+    if match:
+        team_name = match.group(1).strip()
+        if team_name:
+            return None, f"@{team_name}"
+
+    return None, None
+
+
+def get_thread_replies(channel_id, thread_ts):
+    """Get all replies in a thread."""
+    try:
+        result = client.conversations_replies(channel=channel_id, ts=thread_ts)
+        messages = result.get("messages", [])
+        # First message is the parent, rest are replies
+        return messages[1:] if len(messages) > 1 else []
+    except slack.errors.SlackApiError as e:
+        print(f"Error fetching thread replies: {e}")
+        return []
+
+
+def get_last_human_replier(replies):
+    """Get the user ID of the last person who replied (excluding bot messages)."""
+    for reply in reversed(replies):
+        if not reply.get("bot_id") and not reply.get("subtype"):
+            return reply.get("user")
+    return None
+
+
+def reply_to_original_thread(channel_id, thread_ts, original_message):
+    """Add a reply to the original message thread with check time and tag the right person."""
     check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    reply_text = (
-        f"🔔 *Reminder Check*\n_Checked at {check_time} - No ✅ found. Reminder sent._"
-    )
+    message_text = original_message.get("text", "")
+
+    # Extract sender and team from ticket
+    sender_id, sender_mention = extract_sender_from_ticket(message_text)
+    team_id, team_mention = extract_team_from_ticket(message_text)
+
+    print(f"   Sender: {sender_mention}, Team: {team_mention}")
+
+    # Get thread replies to determine who to mention
+    replies = get_thread_replies(channel_id, thread_ts)
+    last_replier = get_last_human_replier(replies)
+
+    # Determine who to remind based on last reply
+    if not replies:
+        # No replies yet - remind the sender
+        who_to_remind = sender_mention or team_mention
+        reason = "No replies yet"
+    elif sender_id and last_replier == sender_id:
+        # Sender replied last - remind the team
+        who_to_remind = team_mention or sender_mention
+        reason = "Sender replied, waiting for team"
+    elif team_id and last_replier == team_id:
+        # Team replied last - remind the sender
+        who_to_remind = sender_mention or team_mention
+        reason = "Team replied, waiting for sender"
+    else:
+        # Someone else replied - remind the sender by default
+        who_to_remind = sender_mention or team_mention
+        reason = "Waiting for response"
+
+    print(f"   Reminding: {who_to_remind} ({reason})")
+
+    # Build reply with mention
+    if who_to_remind:
+        reply_text = (
+            f"🔔 *Reminder Check*\n"
+            f"Hey {who_to_remind}! _Checked at {check_time} - No ✅ found._\n"
+            f"_{reason}_\n"
+            f"Please react with ✅ when this is resolved."
+        )
+    else:
+        reply_text = f"🔔 *Reminder Check*\n_Checked at {check_time} - No ✅ found. Reminder sent._"
 
     try:
         client.chat_postMessage(
@@ -189,6 +291,21 @@ def add_checked_reaction(channel_id, message_ts):
     except slack.errors.SlackApiError as e:
         if "already_reacted" not in str(e):
             print(f"Error adding reaction: {e}")
+
+
+def post_date_ended(channel_id, thread_ts):
+    """Post the Date Ended to the thread when ticket is resolved."""
+    end_time = datetime.now().strftime("%B %d, %Y at %I:%M %p GMT+3")
+
+    reply_text = f"✅ *Ticket Resolved*\n" f"📅 *Date Ended:* {end_time}"
+
+    try:
+        client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts, text=reply_text
+        )
+        print(f"✅ Posted Date Ended: {end_time}")
+    except slack.errors.SlackApiError as e:
+        print(f"Error posting Date Ended: {e}")
 
 
 def check_and_remind():
@@ -233,16 +350,20 @@ def check_and_remind():
         # Check for checkmark reaction
         has_checkmark = has_checkmark_reaction(monitored_channel_id, message_ts)
 
-        # If message now has ✅ and we sent a reminder for it, DELETE the reminder
-        if has_checkmark and message_ts in sent_reminders:
-            reminder_ts = sent_reminders[message_ts]
-            if delete_reminder(alerts_channel_id, reminder_ts):
-                del sent_reminders[message_ts]
-                reminders_deleted += 1
-            continue
-
-        # If message has ✅, skip (resolved)
+        # If message has ✅ (resolved)
         if has_checkmark:
+            # Delete the reminder if we sent one
+            if message_ts in sent_reminders:
+                reminder_ts = sent_reminders[message_ts]
+                if delete_reminder(alerts_channel_id, reminder_ts):
+                    del sent_reminders[message_ts]
+                    reminders_deleted += 1
+
+            # Post Date Ended if we haven't already
+            if message_ts not in resolved_messages:
+                post_date_ended(monitored_channel_id, message_ts)
+                resolved_messages.add(message_ts)
+
             continue
 
         # Skip messages we've already alerted about
@@ -259,8 +380,8 @@ def check_and_remind():
             reminders_sent += 1
             sent_reminders[message_ts] = reminder_ts
 
-            # 2. Reply to the original thread with check time
-            reply_to_original_thread(monitored_channel_id, message_ts)
+            # 2. Reply to the original thread with check time and tag sender
+            reply_to_original_thread(monitored_channel_id, message_ts, message)
 
             # 3. Add 👀 reaction to mark it was checked
             add_checked_reaction(monitored_channel_id, message_ts)
